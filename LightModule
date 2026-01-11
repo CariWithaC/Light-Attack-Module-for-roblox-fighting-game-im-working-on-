@@ -1,0 +1,812 @@
+local players = game:GetService("Players")
+local rs = game:GetService("ReplicatedStorage")
+local runS = game:GetService("RunService")
+
+local frameworkFolder = rs.Framework
+local animationsFolder = script.Animations
+local remotes = rs.Remotes
+local globalStorage = rs.GlobalStorage
+local characterTools = rs.CharacterTools.Todo
+
+local fxRemote = remotes.FxRemote
+local knockbackRemote = remotes.ApplyKnockback
+
+local attributeCheckModule = require(frameworkFolder.CheckAttributes)
+local hitboxModule = require(frameworkFolder.HitboxModule)
+local hitStunModule = require(frameworkFolder.Hitstun)
+local knockbackService = require(frameworkFolder.KnockbackService)
+local damageModule = require(frameworkFolder.DamageModule)
+local MovementManager = require(frameworkFolder.MovementManager)
+local comboModule = require(frameworkFolder.ComboHandler)
+local anchorHandler = require(frameworkFolder.Anchor)
+
+-- Hit settings
+local standingSettings = {Name = "StandL", Size = Vector3.new(2,1.5,2.5), cframeOffset = CFrame.new(-.8,.5,-2.3), Damage = 2, Stun = .4}
+local crouchingSettings = {Name = "CrouchL", Size = Vector3.new(2,1.5,2.5), cframeOffset = CFrame.new(-.8,-.5,-2), Damage = 2, Stun = .4}
+local airSettings = {Name = "AirL", Size = Vector3.new(2,1.5,2.5), cframeOffset = CFrame.new(-.6,-.6,-2.3), Damage = 2, Stun = .6, FlingForce = {Force = 3, UpForce = 5, Duration = .5, GravityScale = .7}, CurveSettings = {Force = 2, Height = 1, Duration = .4}}
+local ccfSettings = {Name = "CcfL", Size = Vector3.new(4, 8, 8), cframeOffset = CFrame.new(0,0,-5), Damage = 8, Stun = .6, FlingForce = {Force = 40, UpForce = 5, Duration = .5, GravityScale = 0}}
+local ccbSettings = {Name = "CcbL", Size = Vector3.new(3, 3, 4), cframeOffset = CFrame.new(0,-2, -2), Damage = 8, Stun = .6, FlingForce = {Force = 10, upForce = 5, Duration = .4, GravityScale = 0}}
+
+-- Tables for cooldowns and targets
+local standingCd, standingTarget = {}, {}
+local crouchingCd, crouchingTarget = {}, {}
+local airCd, airTarget = {}, {}
+local ccfCd, ccfTarget, ccfFollowUp = {}, {}, {}
+local ccbCd, ccbTarget = {}, {}
+
+-- Air move limiter
+local airAttackCount = {}
+local MAX_AIR_ATTACKS = 2 
+
+local currentRock = {}
+
+local visualizer = false
+
+--------------------------------------------------
+-- Helper: Get latest character reference
+local function GetLatestCharacter(character)
+	if character and character:IsA("Model") and character.Parent ~= workspace then
+		local updated = workspace:FindFirstChild(character.Name)
+		if updated and updated:IsA("Model") then return updated end
+	end
+	return character
+end
+
+--------------------------------------------------
+-- Helper: FlingFunction
+
+local function flingForces(attacker, targetChar, moveSettings, cJuggle)
+	if not attacker or not targetChar then return end
+
+	local attackerRoot = attacker:FindFirstChild("HumanoidRootPart")
+	local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
+	if not attackerRoot or not targetRoot then return end
+
+	-- ===== DEFAULTS =====
+	local force = 8
+	local upForce = 5
+	local duration = 0.15
+	local direction = attackerRoot.CFrame.LookVector
+	local useCurve = false
+	local curveHeight = 0
+	local curveDrop = 10
+
+	-- PvP multipliers
+	local linearPower = 2.8     -- default horizontal linear multiplier
+	local linearUpPower = 1.8     -- default vertical linear multiplier
+	local curvePower = 1.2       -- default curve multiplier
+
+	-- ===== MOVE SETTINGS OVERRIDE =====
+	if moveSettings.FlingForce then
+		force = moveSettings.FlingForce.Force or force
+		upForce = moveSettings.FlingForce.UpForce or upForce
+		duration = moveSettings.FlingForce.Duration or duration
+		linearPower = moveSettings.FlingForce.LinearPower or linearPower
+		linearUpPower = moveSettings.FlingForce.LinearUpPower or linearUpPower
+	end
+
+	if moveSettings.CurveSettings then
+		useCurve = true
+		local baseHeight = moveSettings.CurveSettings.Height or 3
+		local forceScale = math.clamp((moveSettings.CurveSettings.Force or force) / 15, 0, 1)
+		curveHeight = math.clamp(baseHeight * forceScale, 1, 20)
+		force = moveSettings.CurveSettings.Force or force
+		duration = moveSettings.CurveSettings.Duration or duration
+		curvePower = moveSettings.CurveSettings.CurvePower or curvePower
+	end
+
+	-- ===== CJUGGLE SPECIAL CASE =====
+	if cJuggle == true then
+		local cForce = 2
+		local cHeight = 1
+		local cDuration = 0.3
+		local cDirection = attackerRoot.CFrame.LookVector
+		knockbackService.Curve(attacker, cDirection, cForce, cHeight, cDuration, curvePower, curveDrop)
+	end
+
+	-- ===== APPLY KNOCKBACK =====
+	if useCurve then
+		knockbackService.Curve(targetChar, direction, force, curveHeight, duration, curvePower, curveDrop)
+	else
+		knockbackService.Apply(targetChar, direction, force, upForce, duration, linearPower, linearUpPower)
+	end
+end
+
+
+
+---------------------------------------------------
+-- Hitstun Decay
+local function decayedHitstun(character, targetChar, baseStun)
+
+	local currentCombo = comboModule.GetComboCount(character, targetChar) -- you already track combos
+
+	local decayMultiplier = 0.98 ^ currentCombo
+	local finalStun = baseStun * decayMultiplier
+
+	if finalStun < 0.1 then
+		finalStun = 0.1 -- guarantee minimum hitstop but no true combo
+	end
+
+	return finalStun
+
+end
+
+--------------------------------------------------
+-- Helper: Connect hit detection
+local function connectHit(character, player, animTrack, targetTable, moveSettings, customFling, hitStopTime, hitFx, hitType)
+	local hits = hitboxModule.CreateHitbox(moveSettings.Size, character:GetAttribute("HrpCFrame"), moveSettings.cframeOffset, visualizer, hitType)
+	local dcd = false
+
+	for _, hit in hits do
+		if hit.Parent and hit.Parent:FindFirstChild("Humanoid") and hit.Parent ~= character and not dcd then
+			local targetChar = hit.Parent
+
+			-- Skip invalid targets
+			if targetChar:GetAttribute("IsKnockedDown") or targetChar:GetAttribute("IsGettingUp") or
+				targetChar:GetAttribute("IsInvincible") or character:GetAttribute("IsStunned") or
+				character:GetAttribute("IsInHitstun") then
+				return
+			end
+
+			dcd = true
+			targetTable[character] = true
+			animTrack.Priority = Enum.AnimationPriority.Action2
+
+			local extraStun = hitStopTime or 0
+
+			-- Apply damage and hitstun
+			local hitTrack = damageModule.Damage(character, targetChar, moveSettings.Damage, targetChar:GetAttribute("Side"))
+
+			--local hitStun = decayedHitstun(character, targetChar, moveSettings.Stun)
+			hitStunModule.Apply(targetChar, moveSettings.Stun + extraStun)
+
+			comboModule.TrackCombo(character, targetChar)
+			comboModule.AddSkill(character, moveSettings.Name)
+			
+			-- Hit Fx
+
+			if hitFx == true then
+
+				local fxCF = CFrame.new(0,0,0)
+
+				if hitType == "Medium" then
+					fxCF = CFrame.new(0,0,0)
+				elseif hitType == "Low" then
+					fxCF = CFrame.new(0,-2,0)
+				elseif hitType == "High" then
+					fxCF = CFrame.new(0,2,0)
+				end
+
+				fxRemote:FireAllClients("FlashFx", 
+					globalStorage.HitFx.Attachment, 
+					targetChar.HumanoidRootPart,
+					fxCF,
+					3
+				)
+			end
+
+			-- Example usage:
+			
+			local cJuggle = false
+			
+			if character:GetAttribute("IsAirborne") == true then
+				cJuggle = true
+			end
+			
+			if hitStopTime and hitStopTime > 0 then
+				--knockbackService.Cancel(targetChar)
+				hitTrack:AdjustSpeed(0)
+				for _, track in character.Humanoid.Animator:GetPlayingAnimationTracks() do
+					track:AdjustSpeed(0)
+				end
+				anchorHandler.Apply(character, 1000)
+				anchorHandler.Apply(targetChar, 1000)
+				task.delay(hitStopTime, function()
+					hitTrack:AdjustSpeed(1)
+					for _, track in character.Humanoid.Animator:GetPlayingAnimationTracks() do
+						track:AdjustSpeed(1)
+					end
+					anchorHandler.Remove(character)
+					anchorHandler.Remove(targetChar)
+					flingForces(character, targetChar, moveSettings, cJuggle)
+				end)
+			else
+				flingForces(character, targetChar, moveSettings, cJuggle)
+			end
+
+		end
+	end
+end
+
+
+local function customCCF(character, player, animTrack, targetTable, moveSettings, hitStopTime, hitFx, hitType)
+
+	local dcd = false
+
+	local hits = hitboxModule.CreateHitbox(moveSettings.Size, character:GetAttribute("HrpCFrame"), moveSettings.cframeOffset, visualizer,  hitType)
+
+	local newSound = characterTools.Clap:Clone()
+	newSound.Parent = character.HumanoidRootPart
+	newSound:Play()
+	game.Debris:AddItem(newSound, newSound.TimeLength)
+
+	for _, hit in hits do
+		if hit.Parent and hit.Parent:FindFirstChild("Humanoid") and hit.Parent ~= character and not dcd then
+			local targetChar = hit.Parent
+
+			if targetChar:GetAttribute("IsKnockedDown") or targetChar:GetAttribute("IsGettingUp") or
+				targetChar:GetAttribute("IsInvincible") or character:GetAttribute("IsStunned") or
+				character:GetAttribute("IsInHitstun") then
+				return
+			end
+
+			targetChar.HumanoidRootPart.Velocity = vector.zero
+			knockbackService.Cancel(targetChar)
+
+			dcd = true
+			targetTable[character] = true
+			animTrack.Priority = Enum.AnimationPriority.Action2
+
+			if targetChar:GetAttribute("IsStunned") == true then
+				hitStunModule.Apply(targetChar, .4)
+			end
+
+			fxRemote:FireAllClients("FlashFx", 
+				characterTools.BoogieWoogie.Attachment, 
+				targetChar.HumanoidRootPart,
+				CFrame.new(0,0,0),
+				3
+			)
+
+			fxRemote:FireAllClients("FlashFx", 
+				characterTools.BoogieWoogie.Attachment, 
+				character.HumanoidRootPart,
+				CFrame.new(0,0,0),
+				3
+			)
+
+			local charPos = character:GetAttribute("HrpCFrame") * CFrame.new(0,0,4)
+
+			targetChar.HumanoidRootPart.CFrame = charPos
+
+			--animTrack.Priority = Enum.AnimationPriority.Action3
+
+			task.delay(.1, function()
+
+				local sideFolder = animationsFolder:FindFirstChild(character:GetAttribute("Side"))
+
+				local newTrack = character.Humanoid.Animator:LoadAnimation(sideFolder.CCFFollowUp)
+				animTrack.Priority = Enum.AnimationPriority.Core
+				newTrack.Priority = Enum.AnimationPriority.Action
+				newTrack:Play()
+
+				newTrack.KeyframeReached:Connect(function(kf)
+					if kf == "Hit" then
+
+						local dcd = false
+						local newHits = hitboxModule.CreateHitbox(Vector3.new(2, 2, 3), character:GetAttribute("HrpCFrame"), CFrame.new(0,1,-2.5), visualizer,  hitType)
+
+						for _, hit in newHits do
+							if hit.Parent and hit.Parent:FindFirstChild("Humanoid") and hit.Parent ~= character and not dcd then
+								local targetChar = hit.Parent
+
+								if targetChar:GetAttribute("IsKnockedDown") or targetChar:GetAttribute("IsGettingUp") or
+									targetChar:GetAttribute("IsInvincible") or character:GetAttribute("IsStunned") or
+									character:GetAttribute("IsInHitstun") then
+									return
+								end
+
+								dcd = true
+								ccfFollowUp[character] = true
+
+								local extraStun = hitStopTime or 0
+
+								-- Apply damage and hitstun
+								local hitTrack = damageModule.Damage(character, targetChar, moveSettings.Damage, targetChar:GetAttribute("Side"))
+
+								local hitStun = decayedHitstun(character, targetChar, moveSettings.Stun)
+								hitStunModule.Apply(targetChar, hitStun + extraStun)
+
+								comboModule.TrackCombo(character, targetChar)
+								comboModule.AddSkill(character, moveSettings.Name)
+
+								-- Hit Fx
+
+								if hitFx == true then
+
+									local fxCF = CFrame.new(0,0,0)
+
+									if hitType == "Medium" then
+										fxCF = CFrame.new(0,0,0)
+									elseif hitType == "Low" then
+										fxCF = CFrame.new(0,-2,0)
+									elseif hitType == "High" then
+										fxCF = CFrame.new(0,2,0)
+									end
+
+									fxRemote:FireAllClients("FlashFx", 
+										globalStorage.HitFx.Attachment, 
+										targetChar.HumanoidRootPart,
+										fxCF,
+										3
+									)
+								end
+
+								-- Example usage:
+								flingForces(character, targetChar, moveSettings)
+							end
+						end
+					end
+
+					if kf == "EndStun" then
+						--warn("STUN ENDING")
+					end
+
+				end)
+
+			end)
+
+		end	
+	end
+end
+
+local function customCCB(character, player, animTrack, targetTable, moveSettings, hitStopTime, hitFx, hitType)
+
+	local dcd = false
+
+	local hits = hitboxModule.CreateHitbox(moveSettings.Size, character:GetAttribute("HrpCFrame"), moveSettings.cframeOffset, visualizer,  hitType)
+
+	for _, hit in hits do
+		if hit.Parent and hit.Parent:FindFirstChild("Humanoid") and hit.Parent ~= character and not dcd then
+			local targetChar = hit.Parent
+
+			if targetChar:GetAttribute("IsGettingUp") or
+				targetChar:GetAttribute("IsInvincible") or character:GetAttribute("IsStunned") or
+				character:GetAttribute("IsInHitstun") then
+				return
+			end
+
+			dcd = true
+			targetTable[character] = true
+			animTrack.Priority = Enum.AnimationPriority.Action2
+
+			local extraStun = hitStopTime or 0
+
+			local hitTrack = damageModule.Damage(character, targetChar, moveSettings.Damage, targetChar:GetAttribute("Side"))
+
+			if targetChar:GetAttribute("IsKnockedDown") ~= true then
+				local hitStun = decayedHitstun(character, targetChar, moveSettings.Stun)
+				hitStunModule.Apply(targetChar, hitStun + extraStun)
+			end
+
+			comboModule.TrackCombo(character, targetChar)
+			comboModule.AddSkill(character, moveSettings.Name)
+
+			-- Hit Fx
+
+			if hitFx == true then
+
+				local fxCF = CFrame.new(0,0,0)
+
+				if hitType == "Medium" then
+					fxCF = CFrame.new(0,0,0)
+				elseif hitType == "Low" then
+					fxCF = CFrame.new(0,-2,0)
+				elseif hitType == "High" then
+					fxCF = CFrame.new(0,2,0)
+				end
+
+				fxRemote:FireAllClients("FlashFx", 
+					globalStorage.HitFx.Attachment, 
+					targetChar.HumanoidRootPart,
+					fxCF,
+					3
+				)
+			end
+
+			-- Example usage:
+			if targetChar:GetAttribute("IsKnockedDown") ~= true then
+				flingForces(character, targetChar, moveSettings)
+			end
+
+		end
+
+	end
+
+end
+
+--------------------------------------------------
+-- Reset movement safely
+local function resetMovement(character, humanoid)
+	if not character:GetAttribute("IsCrouching") and MovementManager:CanMove("Attack") then
+		humanoid.WalkSpeed = 10
+		humanoid.JumpHeight = 10
+	end
+	MovementManager:ReleaseControl("Attack")
+end
+
+-- Reset air limiter when character lands
+local function setupLandingReset(character)
+	if not character or not character:FindFirstChild("HumanoidRootPart") then return end
+
+	local root = character:FindFirstChild("HumanoidRootPart")
+
+	-- Connect to attribute changes
+	character:GetAttributeChangedSignal("IsAirborne"):Connect(function()
+		if character:GetAttribute("IsAirborne") == false then
+			airAttackCount[character] = 0 -- reset on landing
+		end
+	end)
+end
+
+local module = {}
+
+function module.Standing(character)
+
+	character = GetLatestCharacter(character)
+	local player = players:GetPlayerFromCharacter(character)
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid then return end
+
+	if attributeCheckModule.CheckAttributes(character, true, true, true, true, true, true, true, true, true, true, true) and not standingCd[character] then
+		if not MovementManager:RequestControl("Attack") then return end
+		standingCd[character] = true
+		standingTarget[character] = nil
+		character:SetAttribute("IsAttacking", true)
+		humanoid.WalkSpeed = 0
+		humanoid.JumpHeight = 0
+
+		local side = character:GetAttribute("Side")
+		local animTrack = humanoid:LoadAnimation(animationsFolder:FindFirstChild(side).Standing)
+		animTrack.Priority = Enum.AnimationPriority.Action3
+		animTrack:Play()
+
+
+
+		animTrack.KeyframeReached:Connect(function(kf)
+			if kf == "Hit" then
+				connectHit(character, player, animTrack, standingTarget, standingSettings, nil, 0.08, true, "Medium")
+				if character:GetAttribute("IsStunned") == false then
+
+					if not character:GetAttribute("Rock") then return end
+
+					if (tick() - character:GetAttribute("Rock")) < .8 then
+
+						if currentRock[character] and currentRock[character]:GetAttribute("Owner") == character.Name then
+
+							local projectileFx = fxRemote:FireAllClients("Projectile",
+								characterTools.Rock,
+								character.HumanoidRootPart.CFrame * CFrame.new(0,0,-1),
+								CFrame.Angles(math.rad(0), math.rad(90), math.rad(0)),
+								10,
+								character.HumanoidRootPart.CFrame.LookVector,
+								90
+							)
+
+							currentRock[character]:Destroy()
+
+							local dcd = false
+							local hits = hitboxModule.CreateProjectile(character, Vector3.new(2,2,2), character:GetAttribute("HrpCFrame"), CFrame.new(0,0,-1), false, "Medium", 10, 3, 5, CFrame.new(0,0,-2))
+
+							if hits then
+								for _, hit in hits do
+									if hit.Parent and hit.Parent:FindFirstChild("Humanoid") and hit.Parent ~= character and dcd == false then
+
+										local targetChar = hit.Parent
+
+										if targetChar:GetAttribute("IsKnockedDown") or targetChar:GetAttribute("IsGettingUp") or
+											targetChar:GetAttribute("IsInvincible") or character:GetAttribute("IsStunned") or
+											character:GetAttribute("IsInHitstun") then
+											return
+										end
+
+										dcd = true
+										animTrack.Priority = Enum.AnimationPriority.Action2
+
+										local extraStun = .08
+
+										local hitTrack = damageModule.Damage(character, targetChar, 3, targetChar:GetAttribute("Side"))
+
+										local hitStun = decayedHitstun(character, targetChar, .3)
+										hitStunModule.Apply(targetChar, hitStun + extraStun)
+
+										comboModule.TrackCombo(character, targetChar)
+										comboModule.AddSkill(character, "CcbFollowUp")
+
+										-- Hit Fx
+
+										local fxCF = CFrame.new(0,0,0)
+
+										fxRemote:FireAllClients("FlashFx", 
+											globalStorage.HitFx.Attachment, 
+											targetChar.HumanoidRootPart,
+											fxCF,
+											3
+										)
+
+										-- Optional hit stop
+										
+										if .08 > 0 then
+											--knockbackService.Cancel(targetChar)
+											hitTrack:AdjustSpeed(0)
+											for _, track in character.Humanoid.Animator:GetPlayingAnimationTracks() do
+												track:AdjustSpeed(0)
+											end
+											anchorHandler.Apply(character, 1000)
+											anchorHandler.Apply(targetChar, 1000)
+											task.delay(.08, function()
+												hitTrack:AdjustSpeed(1)
+												for _, track in character.Humanoid.Animator:GetPlayingAnimationTracks() do
+													track:AdjustSpeed(1)
+												end
+												anchorHandler.Remove(character)
+												anchorHandler.Remove(targetChar)
+												flingForces(character, targetChar, {FlingForces = {Force = 5, UpForce = 2, .2, 2.5}}, false)
+											end)
+										else
+											flingForces(character, targetChar, {FlingForces = {Force = 5, UpForce = 2, .2, 2.5}}, false)
+										end
+									end	
+								end
+							end
+						end	
+
+					end
+				end
+			elseif kf == "EndStun" then
+				local function resetChar(endLag)
+					task.delay(endLag, function()
+						character:SetAttribute("IsAttacking", false)
+						resetMovement(character, humanoid)
+						standingCd[character] = nil
+					end)
+				end
+
+				local endLag = 0
+
+				if standingTarget[character] then
+					--print("Hit Confirmed")
+					-- Hit confirmed → apply normal endlag
+					endLag = 0.01
+				else
+					-- Whiff → almost no endlag
+					--print("Whiff")
+					endLag = 0.15
+				end
+
+				resetChar(endLag)
+			end
+		end)
+
+	end
+end
+
+function module.Crouching(character)
+	character = GetLatestCharacter(character)
+	local player = players:GetPlayerFromCharacter(character)
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid or not character:GetAttribute("IsCrouching") then return end
+
+	if attributeCheckModule.CheckAttributes(character, true, true, true, true, true, true, nil, true, true, true, true) and not crouchingCd[character] then
+		if humanoid.FloorMaterial == Enum.Material.Air then return end
+		if not MovementManager:RequestControl("Attack") then return end
+		if humanoid.WalkSpeed ~= 0 then return end
+		crouchingCd[character] = true
+		crouchingTarget[character] = nil
+		character:SetAttribute("IsAttacking", true)
+		humanoid.WalkSpeed = 0
+		humanoid.JumpHeight = 0
+
+		local side = character:GetAttribute("Side")
+		local animTrack = humanoid:LoadAnimation(animationsFolder:FindFirstChild(side).Crouching)
+		animTrack.Priority = Enum.AnimationPriority.Action3
+		animTrack:Play()
+
+		animTrack.KeyframeReached:Connect(function(kf)
+			if kf == "Hit" then
+				connectHit(character, player, animTrack, crouchingTarget, crouchingSettings, nil, 0.08, true, "Medium")
+			elseif kf == "EndStun" then
+				local function resetChar(endLag)
+					task.delay(endLag, function()
+						character:SetAttribute("IsAttacking", false)
+						resetMovement(character, humanoid)
+						crouchingCd[character] = nil
+					end)
+				end
+
+				local endLag = 0
+
+				if crouchingTarget[character] then
+					--print("Hit Confirmed")
+					-- Hit confirmed → apply normal endlag
+					endLag = 0.03
+				else
+					-- Whiff → almost no endlag
+					--print("Whiff")
+					endLag = 0.15
+				end
+
+				resetChar(endLag)
+			end
+		end)
+	end
+end
+
+function module.Air(character)
+
+	character = GetLatestCharacter(character)
+	local player = players:GetPlayerFromCharacter(character)
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid then return end
+
+	--Initialize counter if nil
+	if airAttackCount[character] == nil then
+		airAttackCount[character] = 0
+		setupLandingReset(character)
+	end
+
+	--Prevent overusing air attacks
+	if airAttackCount[character] >= MAX_AIR_ATTACKS then
+		return -- exceeded limit, can't attack again in air
+	end
+
+	if attributeCheckModule.CheckAttributes(character, true, true, true, true, true, nil, true, true, true, true, true) and not airCd[character] then
+		if not MovementManager:RequestControl("Attack") then return end
+		airCd[character] = true
+		airTarget[character] = nil
+		airAttackCount[character] += 1
+		character:SetAttribute("IsAttacking", true)
+		humanoid.WalkSpeed = 0
+		humanoid.JumpHeight = 0
+
+		local side = character:GetAttribute("Side")
+		local animTrack = humanoid:LoadAnimation(animationsFolder:FindFirstChild(side).Jumping)
+		animTrack.Priority = Enum.AnimationPriority.Action3
+		animTrack:Play()
+
+		animTrack.KeyframeReached:Connect(function(kf)
+			if kf == "Hit" then
+				connectHit(character, player, animTrack, airTarget, airSettings, nil, 0.08, true, "Medium")
+			elseif kf == "EndStun" then
+				local function resetChar(endLag)
+					task.delay(endLag, function()
+						character:SetAttribute("IsAttacking", false)
+						resetMovement(character, humanoid)
+						airCd[character] = nil
+					end)
+				end
+
+				local endLag = 0
+
+				if airTarget[character] then
+					--print("Hit Confirmed")
+					-- Hit confirmed → apply normal endlag
+					endLag = 0.01
+				else
+					-- Whiff → almost no endlag
+					--print("Whiff")
+					endLag = 0.15
+				end
+
+				resetChar(endLag)
+			end
+		end)
+
+	end
+end
+
+function module.CCF(character)
+	character = GetLatestCharacter(character)
+	local player = players:GetPlayerFromCharacter(character)
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid then return end
+
+	if attributeCheckModule.CheckAttributes(character, true, true, true, true, true, true, true, true, true, true, true) and not ccfCd[character] then
+		if not MovementManager:RequestControl("Attack") then return end
+		ccfCd[character] = true
+		ccfTarget[character] = nil
+		character:SetAttribute("IsAttacking", true)
+		humanoid.WalkSpeed = 0
+		humanoid.JumpHeight = 0
+
+		local side = character:GetAttribute("Side")
+		local animTrack = humanoid:LoadAnimation(animationsFolder:FindFirstChild(side).BoogieWoogie)
+		animTrack.Priority = Enum.AnimationPriority.Action3
+		animTrack:Play()
+
+		fxRemote:FireAllClients("Highlight", character, "Fill", .3, Color3.new(0.3, 0, 1), .5, .4, nil)
+
+		animTrack.KeyframeReached:Connect(function(kf)
+			if kf == "Hit" then
+				customCCF(character, player, animTrack, ccfTarget, ccfSettings, nil, 0.08, "Medium")
+			elseif kf == "EndStun" then
+				local function resetChar(endLag)
+					task.delay(endLag, function()
+						character:SetAttribute("IsAttacking", false)
+						resetMovement(character, humanoid)
+						ccfCd[character] = nil
+					end)
+				end
+
+				local endLag = 0
+
+				if ccfTarget[character] then
+					--print("Hit Confirmed")
+					-- Hit confirmed → apply normal endlag
+					endLag = .7
+				else
+					-- Whiff → almost no endlag
+					--print("Whiff")
+					endLag = 0.25
+				end
+
+				resetChar(endLag)
+			end
+		end)
+
+	end
+end
+
+function module.CCB(character)
+	character = GetLatestCharacter(character)
+	local player = players:GetPlayerFromCharacter(character)
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid then return end
+
+	if attributeCheckModule.CheckAttributes(character, true, true, true, true, true, true, true, true, true, true, true) and not ccbCd[character] then
+		if not MovementManager:RequestControl("Attack") then return end
+		ccbCd[character] = true
+		ccbTarget[character] = nil
+		character:SetAttribute("IsAttacking", true)
+		humanoid.WalkSpeed = 0
+		humanoid.JumpHeight = 0
+
+		local side = character:GetAttribute("Side")
+		local animTrack = humanoid:LoadAnimation(animationsFolder:FindFirstChild(side).CCB)
+		animTrack.Priority = Enum.AnimationPriority.Action3
+		animTrack:Play()
+
+		animTrack.KeyframeReached:Connect(function(kf)
+			if kf == "Hit" then
+
+				local rock = characterTools.Rock:Clone()
+				rock.CFrame = character:GetAttribute("HrpCFrame") * CFrame.new(0,-1.8, -1.5)
+				rock.Parent = workspace.Fx
+				rock.Name = "Rock"
+				rock:SetAttribute("Owner", "PowerfullNinjaCari")
+				character:SetAttribute("Rock", tick())
+				
+				currentRock[character] = rock
+				
+				knockbackService.CurveObject(rock, character.HumanoidRootPart.CFrame.LookVector, 1, 6, .5, 1)
+
+				customCCB(character, player, animTrack, ccbTarget, ccbSettings, 0.08, true, "Medium")
+			elseif kf == "EndStun" then
+				local function resetChar(endLag)
+					task.delay(endLag, function()
+						character:SetAttribute("IsAttacking", false)
+						resetMovement(character, humanoid)
+						ccbCd[character] = nil
+					end)
+				end
+
+				local endLag = 0
+
+				if ccbTarget[character] then
+					--print("Hit Confirmed")
+					-- Hit confirmed → apply normal endlag
+					endLag = .1
+				else
+					-- Whiff → almost no endlag
+					--print("Whiff")
+					endLag = 0.25
+				end
+
+				resetChar(endLag)
+			end
+		end)
+
+	end
+end
+
+return module
